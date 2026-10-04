@@ -1,0 +1,8 @@
+{
+  "name": "Slobos AFK Aternos Bot",
+  "description": "Multi-server Minecraft AFK Bot dashboard for keeping servers online 24/7.",
+  "version": "1.0.0",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
