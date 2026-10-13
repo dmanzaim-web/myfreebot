@@ -20,11 +20,18 @@ class ServerBot {
     this.manualStop = Boolean(botRecord.manualStop);
     this.startedAt = null;
     this.lastConnection = botRecord.lastConnection || null;
-    this.reconnectAttempts = 0;
+    this.lastSuccessfulConnection = botRecord.lastSuccessfulConnection || botRecord.lastConnection || null;
+    this.lastDisconnectReason = botRecord.lastDisconnectReason || null;
+    this.totalReconnects = Number(botRecord.totalReconnects || 0);
+    this.currentReconnectAttempt = 0;
     this.reconnectTimer = null;
     this.serverPollTimer = null;
+    this.watchdogTimer = null;
+    this.connectingStartedAt = null;
+    this.lastActivity = Date.now();
     this.intervals = [];
     this.lastError = null;
+    this.lastRealError = null;
     this.position = null;
     this.health = 20;
     this.food = 20;
@@ -32,6 +39,7 @@ class ServerBot {
     this.knownSecrets = [];
 
     this.initSecrets();
+    this.startWatchdog();
   }
 
   initSecrets() {
@@ -42,6 +50,28 @@ class ServerBot {
         this.knownSecrets.push(decrypted);
       }
     }
+  }
+
+  startWatchdog() {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = setInterval(() => {
+      if (this.manualStop) {
+        clearInterval(this.watchdogTimer);
+        this.watchdogTimer = null;
+        return;
+      }
+
+      const now = Date.now();
+      // Detect stuck connecting / authenticating (>35s)
+      if ((this.status === "CONNECTING" || this.status === "AUTHENTICATING") && this.connectingStartedAt) {
+        if (now - this.connectingStartedAt > 35000) {
+          this.log("WARNING", "CONNECTION", "Watchdog: Connection handshake stuck (>35s). Forcing cleanup & auto-reconnect.");
+          this.lastDisconnectReason = "Handshake timeout / Stuck connection";
+          this.lastRealError = "Connection stuck in handshake";
+          this.handleDisconnect("handshake_timeout");
+        }
+      }
+    }, 8000);
   }
 
   log(level, category, message) {
@@ -61,6 +91,7 @@ class ServerBot {
   }
 
   recordActivity(type, message) {
+    this.lastActivity = Date.now();
     const act = db.addActivity({
       serverId: this.server.id,
       botId: this.botRecord.id,
@@ -87,6 +118,9 @@ class ServerBot {
       status: this.status,
       manualStop: this.manualStop,
       lastConnection: this.lastConnection,
+      lastSuccessfulConnection: this.lastSuccessfulConnection,
+      lastDisconnectReason: this.lastDisconnectReason,
+      totalReconnects: this.totalReconnects,
       uptime: this.startedAt && this.status === "ONLINE" ? Math.floor((Date.now() - this.startedAt) / 1000) : 0
     });
   }
@@ -96,29 +130,69 @@ class ServerBot {
       ? Math.floor((Date.now() - this.startedAt) / 1000)
       : 0;
 
+    let connectionState = "DISCONNECTED";
+    if (this.status === "ONLINE") connectionState = "STABLE";
+    else if (this.status === "CONNECTING" || this.status === "STARTING") connectionState = "CONNECTING";
+    else if (this.status === "AUTHENTICATING") connectionState = "AUTHENTICATING";
+    else if (this.status === "RECONNECTING" || this.status === "WAITING_FOR_SERVER") connectionState = "RECONNECTING";
+
+    let runtimeHealth = "HEALTHY";
+    if (this.status === "ONLINE") runtimeHealth = "HEALTHY";
+    else if (this.status === "ERROR") runtimeHealth = "CRITICAL";
+    else if (this.manualStop) runtimeHealth = "STOPPED";
+    else runtimeHealth = "RECONNECTING";
+
     return {
       id: this.botRecord.id,
       serverId: this.server.id,
       username: this.botRecord.username,
       status: this.status,
       serverStatus: this.serverStatus,
+      connectionState,
       uptime,
       lastConnection: this.lastConnection,
-      reconnectAttempts: this.reconnectAttempts,
+      lastSuccessfulConnection: this.lastSuccessfulConnection,
+      lastDisconnectReason: this.lastDisconnectReason || "None",
+      totalReconnects: this.totalReconnects,
+      currentReconnectAttempt: this.currentReconnectAttempt,
+      lastActivity: this.lastActivity,
+      runtimeHealth,
+      lastError: this.lastError,
+      lastRealError: this.lastRealError || this.lastError || "None",
       position: this.position,
       health: this.health,
       food: this.food,
       playersCount: this.players.length,
-      lastError: this.lastError,
       manualStop: this.manualStop,
-      persistent247: this.botRecord.config?.persistent247 ?? true
+      persistent247: this.botRecord.config?.persistent247 ?? true,
+      edition: this.server.edition || "java",
+      version: this.server.version || "auto"
     };
+  }
+
+  cleanupExistingBot() {
+    this.clearIntervals();
+    if (this.bot) {
+      try {
+        this.bot.removeAllListeners();
+        if (this.bot._client) {
+          this.bot._client.removeAllListeners();
+          if (this.bot._client.socket && typeof this.bot._client.socket.destroy === "function") {
+            this.bot._client.socket.destroy();
+          }
+        }
+        this.bot.end();
+      } catch {}
+      this.bot = null;
+    }
   }
 
   start() {
     this.manualStop = false;
     this.botRecord.manualStop = false;
     this.lastError = null;
+    this.lastRealError = null;
+    this.currentReconnectAttempt = 0;
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -129,9 +203,12 @@ class ServerBot {
       this.serverPollTimer = null;
     }
 
+    this.startWatchdog();
     this.log("INFO", "CONNECTION", `Starting bot ${this.botRecord.username} for ${this.server.host}:${this.server.port}...`);
     this.recordActivity("BOT_START", `Bot start initiated for ${this.botRecord.username}`);
 
+    this.status = "STARTING";
+    this.emitStatus();
     this.connect();
     return true;
   }
@@ -141,16 +218,20 @@ class ServerBot {
       return;
     }
 
+    this.cleanupExistingBot();
+
     this.status = "CONNECTING";
+    this.connectingStartedAt = Date.now();
     this.emitStatus();
 
     this.log("INFO", "CONNECTION", `Connecting to Minecraft server at ${this.server.host}:${this.server.port || 25565}`);
 
     // Pre-check server availability
-    pingMinecraftServer(this.server.host, this.server.port, 4000)
+    pingMinecraftServer(this.server.host, this.server.port, 4500)
       .then((pingRes) => {
         if (!pingRes.online) {
           this.serverStatus = "OFFLINE";
+          this.lastDisconnectReason = pingRes.error || "Server is offline";
           this.handleServerOffline(pingRes.error || "Server is offline");
           return;
         }
@@ -160,7 +241,7 @@ class ServerBot {
 
         this.spawnMineflayerBot();
       })
-      .catch(() => {
+      .catch((err) => {
         this.spawnMineflayerBot();
       });
   }
@@ -188,6 +269,7 @@ class ServerBot {
       this.registerBotEvents();
     } catch (err) {
       this.lastError = err.message;
+      this.lastRealError = err.message;
       this.status = "ERROR";
       this.log("ERROR", "CONNECTION", `Failed to instantiate Mineflayer client: ${err.message}`);
       this.emitStatus();
@@ -198,13 +280,23 @@ class ServerBot {
   registerBotEvents() {
     if (!this.bot) return;
 
+    this.bot.once("login", () => {
+      this.status = "AUTHENTICATING";
+      this.emitStatus();
+      this.log("INFO", "CONNECTION", `Minecraft protocol handshake successful. Awaiting world spawn...`);
+    });
+
     this.bot.once("spawn", () => {
       this.status = "ONLINE";
       this.serverStatus = "ONLINE";
       this.startedAt = Date.now();
       this.lastConnection = Date.now();
-      this.reconnectAttempts = 0;
+      this.lastSuccessfulConnection = Date.now();
+      this.currentReconnectAttempt = 0;
+      this.connectingStartedAt = null;
       this.lastError = null;
+      this.lastRealError = null;
+      this.lastDisconnectReason = null;
 
       this.log("INFO", "CONNECTION", `Bot successfully joined ${this.server.host} as player "${this.bot.username}"!`);
       this.recordActivity("BOT_ONLINE", `Joined server as ${this.bot.username}`);
@@ -220,6 +312,7 @@ class ServerBot {
 
     this.bot.on("health", () => {
       if (!this.bot) return;
+      this.lastActivity = Date.now();
       this.health = Math.round(this.bot.health || 20);
       this.food = Math.round(this.bot.food || 20);
 
@@ -230,6 +323,7 @@ class ServerBot {
 
     this.bot.on("move", () => {
       if (this.bot && this.bot.entity) {
+        this.lastActivity = Date.now();
         this.position = {
           x: Math.round(this.bot.entity.position.x * 10) / 10,
           y: Math.round(this.bot.entity.position.y * 10) / 10,
@@ -240,6 +334,7 @@ class ServerBot {
 
     this.bot.on("chat", (username, message) => {
       if (!username || username === this.bot?.username) return;
+      this.lastActivity = Date.now();
 
       const chatEntry = db.addChat({
         serverId: this.server.id,
@@ -260,7 +355,7 @@ class ServerBot {
 
     this.bot.on("messagestr", (msg) => {
       const clean = redactSecrets(msg, this.knownSecrets);
-      // Check for server prompt for /login
+      this.lastActivity = Date.now();
       this.checkLoginPrompt(clean);
     });
 
@@ -284,6 +379,8 @@ class ServerBot {
     this.bot.on("kicked", (reason) => {
       const reasonStr = typeof reason === "object" ? JSON.stringify(reason) : String(reason);
       this.lastError = `Kicked: ${reasonStr}`;
+      this.lastRealError = `Kicked: ${reasonStr.slice(0, 100)}`;
+      this.lastDisconnectReason = `Kicked: ${reasonStr.slice(0, 80)}`;
       this.log("WARNING", "CONNECTION", `Kicked from server: ${reasonStr}`);
       this.recordActivity("BOT_KICKED", `Kicked: ${reasonStr.slice(0, 80)}`);
       this.evaluateWorkflows("on_kicked", { reason: reasonStr });
@@ -291,12 +388,14 @@ class ServerBot {
 
     this.bot.on("error", (err) => {
       this.lastError = err.message;
+      this.lastRealError = err.message;
+      this.lastDisconnectReason = err.message;
       this.log("ERROR", "SYSTEM", `Mineflayer error: ${err.message}`);
     });
 
     this.bot.on("end", (reason) => {
-      this.clearIntervals();
       const endReason = reason || "connection_closed";
+      this.lastDisconnectReason = endReason;
       this.log("INFO", "CONNECTION", `Connection ended (${endReason})`);
       this.handleDisconnect(endReason);
     });
@@ -319,20 +418,21 @@ class ServerBot {
   }
 
   handleDisconnect(reason) {
-    this.clearIntervals();
-    this.bot = null;
+    this.totalReconnects += 1;
+    this.currentReconnectAttempt += 1;
+    this.cleanupExistingBot();
     this.position = null;
     this.players = [];
 
     if (this.manualStop) {
-      this.status = "STOPPED";
+      this.status = "OFFLINE";
       this.log("INFO", "CONNECTION", "Bot stopped manually.");
       this.recordActivity("BOT_STOP", "Bot stopped by user.");
       this.emitStatus();
       return;
     }
 
-    // Ping server to check if server is offline or just disconnected
+    // Immediate check if server is offline or online
     pingMinecraftServer(this.server.host, this.server.port, 4000)
       .then((pingRes) => {
         if (!pingRes.online) {
@@ -350,15 +450,16 @@ class ServerBot {
 
   handleServerOffline(reasonMsg) {
     this.status = "WAITING_FOR_SERVER";
+    this.lastDisconnectReason = `Server Offline (${reasonMsg})`;
     this.emitStatus();
-    this.log("WARNING", "CONNECTION", `Minecraft server is currently offline (${reasonMsg}). MCFBOT will automatically reconnect when the server comes back online.`);
+    this.log("WARNING", "CONNECTION", `Minecraft server is currently offline (${reasonMsg}). myfreebot 24/7 supervisor is actively listening and will rejoin instantly upon boot.`);
     this.recordActivity("SERVER_OFFLINE", "Server offline. Waiting for return.");
 
     if (this.serverPollTimer) {
       clearInterval(this.serverPollTimer);
     }
 
-    // Active polling for server returning online (every 10 seconds)
+    // Active polling every 6 seconds for server boot
     this.serverPollTimer = setInterval(async () => {
       if (this.manualStop) {
         clearInterval(this.serverPollTimer);
@@ -367,18 +468,18 @@ class ServerBot {
       }
 
       try {
-        const pingRes = await pingMinecraftServer(this.server.host, this.server.port, 4000);
+        const pingRes = await pingMinecraftServer(this.server.host, this.server.port, 3500);
         if (pingRes.online) {
-          this.log("INFO", "CONNECTION", `Minecraft server is back online! Latency: ${pingRes.latency}ms. Reconnecting bot...`);
+          this.log("INFO", "CONNECTION", `Minecraft server is back online! Latency: ${pingRes.latency}ms. Reconnecting bot immediately...`);
           this.recordActivity("SERVER_ONLINE", "Server back online! Reconnecting bot.");
           clearInterval(this.serverPollTimer);
           this.serverPollTimer = null;
           this.serverStatus = "ONLINE";
-          this.reconnectAttempts = 0;
+          this.currentReconnectAttempt = 0;
           this.connect();
         }
       } catch {}
-    }, 10000);
+    }, 6000);
   }
 
   scheduleReconnect(reason = "network") {
@@ -391,24 +492,23 @@ class ServerBot {
       return;
     }
 
-    this.reconnectAttempts += 1;
     this.status = "RECONNECTING";
     this.emitStatus();
 
-    const maxRetries = config.maxRetries || 0; // 0 = infinite
-    if (maxRetries > 0 && this.reconnectAttempts > maxRetries) {
-      this.status = "STOPPED";
-      this.log("WARNING", "CONNECTION", `Max reconnection attempts (${maxRetries}) reached. Stopped.`);
+    // Check if user set an explicit positive maxRetries
+    const maxRetries = Number(config.maxRetries || 0);
+    if (maxRetries > 0 && this.currentReconnectAttempt > maxRetries) {
+      this.status = "OFFLINE";
+      this.log("WARNING", "CONNECTION", `Configured retry limit (${maxRetries}) reached. Stopped.`);
       this.emitStatus();
       return;
     }
 
-    const baseDelay = Number(config.retryDelay || 5000);
-    // Exponential backoff: 5s, 10s, 20s, 40s, capped at 60s
-    const exponentialMultiplier = Math.min(12, Math.pow(2, Math.min(this.reconnectAttempts - 1, 4)));
-    const delay = Math.min(baseDelay * exponentialMultiplier, 60000);
+    // Infinite Auto-Reconnect with Fast initial retry + Jittered Exponential Backoff
+    const exp = Math.pow(1.5, Math.min(this.currentReconnectAttempt - 1, 6));
+    const delay = Math.min(Math.round(2500 * exp), 35000) + Math.floor(Math.random() * 1500);
 
-    this.log("INFO", "CONNECTION", `Reconnecting in ${Math.round(delay / 1000)}s (Attempt #${this.reconnectAttempts})`);
+    this.log("INFO", "CONNECTION", `[Infinite Reconnect #${this.currentReconnectAttempt}] Reconnecting in ${(delay / 1000).toFixed(1)}s (Total Reconnects: ${this.totalReconnects})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -421,6 +521,7 @@ class ServerBot {
   stop() {
     this.manualStop = true;
     this.botRecord.manualStop = true;
+    this.connectingStartedAt = null;
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -431,20 +532,9 @@ class ServerBot {
       this.serverPollTimer = null;
     }
 
-    this.clearIntervals();
+    this.cleanupExistingBot();
 
-    if (this.bot) {
-      try {
-        this.bot.quit("Stopped by user");
-      } catch {
-        try {
-          this.bot.end();
-        } catch {}
-      }
-      this.bot = null;
-    }
-
-    this.status = "STOPPED";
+    this.status = "OFFLINE";
     this.log("INFO", "CONNECTION", "Bot stopped manually.");
     this.recordActivity("BOT_STOPPED", "Bot stopped manually.");
     this.emitStatus();
@@ -452,11 +542,11 @@ class ServerBot {
   }
 
   restart() {
-    this.log("INFO", "CONNECTION", "Restarting bot...");
+    this.log("INFO", "CONNECTION", "Restarting bot runtime...");
     this.stop();
     setTimeout(() => {
       this.start();
-    }, 1500);
+    }, 1200);
     return true;
   }
 
@@ -777,6 +867,36 @@ class BotManager {
         }
       }
     }, 30000);
+  }
+
+  executeScheduleNow(serverId, scheduleId) {
+    const schedules = db.getSchedules(serverId) || [];
+    const schedule = schedules.find((s) => s.id === scheduleId);
+    if (!schedule) return { success: false, message: "Schedule not found" };
+
+    const serverMap = this.servers.get(serverId);
+    const activeBot = serverMap ? Array.from(serverMap.values()).find((b) => b.status === "ONLINE") : null;
+
+    if (!activeBot) {
+      return { success: false, message: "Bot is not currently ONLINE to execute this schedule." };
+    }
+
+    if (schedule.actionType === "command") {
+      activeBot.sendCommand(schedule.actionPayload);
+    } else if (schedule.actionType === "chat") {
+      activeBot.sendChat(schedule.actionPayload);
+    }
+
+    const now = Date.now();
+    const intervalMs = Math.max(1, Number(schedule.intervalMinutes || 5)) * 60 * 1000;
+    const updated = db.saveSchedule({
+      ...schedule,
+      lastRun: now,
+      nextRun: now + intervalMs,
+      runCount: (schedule.runCount || 0) + 1
+    });
+
+    return { success: true, schedule: updated, message: `Executed scheduled ${schedule.actionType}` };
   }
 
   registerServer(server, botRecord) {

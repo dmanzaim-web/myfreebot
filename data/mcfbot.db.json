@@ -1,0 +1,44 @@
+{
+  "servers": [],
+  "bots": [],
+  "workflows": [],
+  "schedules": [],
+  "logs": [],
+  "chat_messages": [],
+  "activities": [],
+  "backups": [],
+  "builder_tasks": [],
+  "builder_evidence": [],
+  "builder_reports": [],
+  "builder_chat": [],
+  "builder_settings": [],
+  "ai_conversations": [
+    {
+      "serverId": "srv_1791921612374_0t6ki",
+      "title": "لماذا انقطع البوت وكيف أحافظ عليه 24/7؟",
+      "messages": [
+        {
+          "id": "msg_1791921612759_vygn",
+          "role": "user",
+          "content": "لماذا انقطع البوت وكيف أحافظ عليه 24/7؟",
+          "mode": "chat",
+          "thought": null,
+          "actions": [],
+          "timestamp": 1791921612759
+        },
+        {
+          "id": "msg_1791921613503_1cjn",
+          "role": "assistant",
+          "content": "### 🔍 تحليل حالة الاتصال لسيرفر **Aternos Test Hub**\n\nبناءً على فحص السجلات الحية لـ **myfreebot**:\n- **حالة السيرفر:** 🟢 Online (الاستجابة: 321ms)\n- **حالة البوت:** AUTHENTICATING\n- **عدد محاولات إعادة الاتصال اليوم:** 0 محاولة\n- **خاصية 24/7 Persistent:** مفعلة وتعمل بالخلفية\n\n**الأسباب الأكثر شيوعاً لانقطاع البوت:**\n1. **وضع Cracked غير مفعّل:** إذا كان سيرفرك على Aternos، تأكد من الدخول إلى *Options* وتفعيل **Cracked**.\n2. **توافق الإصدارات:** إصدار سيرفرك المسجل هو `1.20.4`. إذا قمت بتحديث السيرفر مؤخراً، قم بتثبيت بلجن **ViaVersion** أو **ViaBackwards**.\n3. **توقف السيرفر المجاني:** السيرفرات المجانية تغلق تلقائياً عند خلوها من اللاعبين. نظام myfreebot يظل يترصد ويعيد ربط البوت بمجرد تشغيل السيرفر.",
+          "mode": "chat",
+          "thought": "تحليل الرسالة ومقارنتها بسياق السيرفر الحالي...",
+          "actions": [],
+          "timestamp": 1791921613874
+        }
+      ],
+      "id": "conv_1791921612758_t1ktj",
+      "createdAt": 1791921612758,
+      "updatedAt": 1791921613874
+    }
+  ]
+}

@@ -127,6 +127,35 @@ function redactSecrets(message, knownSecrets = []) {
 }
 
 /**
+ * Generate a short, clean, memorable Access Code based on server name
+ * Format: <NAME>-<4 digits> (e.g., HEARTLYSMP-4827, MYSERVER-2719)
+ */
+function generateAccessCode(serverName) {
+  let cleanName = String(serverName || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  if (!cleanName || cleanName.length < 3) {
+    cleanName = "SERVER";
+  }
+
+  // Keep prefix readable and concise (max 10 chars)
+  if (cleanName.length > 10) {
+    cleanName = cleanName.slice(0, 10);
+  }
+
+  // 4 secure random digits (1000 - 9999)
+  const codeNum = crypto.randomInt(1000, 10000);
+  return `${cleanName}-${codeNum}`;
+}
+
+function normalizeAccessCode(code) {
+  if (!code) return "";
+  return String(code).trim().toUpperCase();
+}
+
+/**
  * In-memory sliding-window rate limiter for anonymous abuse protection
  */
 class RateLimiter {
@@ -164,12 +193,89 @@ class RateLimiter {
   }
 }
 
+const bcrypt = require("bcryptjs");
+
+/**
+ * Normalize Minecraft server host and port into a canonical identity
+ * (e.g. "Play.Hypixel.Net:25565", "play.hypixel.net", "play.hypixel.net." -> "play.hypixel.net:25565")
+ */
+function normalizeServerAddress(rawHost, rawPort) {
+  let host = String(rawHost || "").trim().toLowerCase();
+  host = host.replace(/^[a-z]+:\/\//i, "");
+  host = host.split("/")[0].split("?")[0];
+  if (host.includes(":")) {
+    const parts = host.split(":");
+    host = parts[0];
+    if (!rawPort) rawPort = parts[1];
+  }
+  host = host.replace(/\.+$/, "").trim();
+
+  let port = parseInt(rawPort, 10);
+  if (!port || isNaN(port) || port < 1 || port > 65535) {
+    port = 25565;
+  }
+
+  return {
+    host,
+    port,
+    normalized: `${host}:${port}`
+  };
+}
+
+/**
+ * Hash server access password using bcrypt
+ */
+function hashServerPassword(password) {
+  if (!password || typeof password !== "string") return null;
+  return bcrypt.hashSync(password, 10);
+}
+
+/**
+ * Verify server access password against bcrypt hash
+ */
+function verifyServerPassword(password, hash) {
+  if (!password || !hash) return false;
+  try {
+    return bcrypt.compareSync(password, hash);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Generate a cryptographically secure random session token
+ */
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+/**
+ * Generate a random memorable secure server password for regeneration
+ */
+function generateSecureServerPassword(length = 12) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%";
+  let pwd = "";
+  for (let i = 0; i < length; i++) {
+    pwd += chars[crypto.randomInt(0, chars.length)];
+  }
+  return pwd;
+}
+
 module.exports = {
   encryptSecret,
   decryptSecret,
   generateAccessKey,
   hashAccessKey,
   verifyAccessKey,
+  generateAccessCode,
+  normalizeAccessCode,
+  normalizeServerAddress,
+  hashServerPassword,
+  verifyServerPassword,
+  generateSessionToken,
+  generateSecureServerPassword,
   redactSecrets,
   RateLimiter
 };
+
+

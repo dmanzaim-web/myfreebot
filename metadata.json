@@ -1,6 +1,6 @@
 {
-  "name": "Slobos AFK Aternos Bot",
-  "description": "Multi-server Minecraft AFK Bot dashboard for keeping servers online 24/7.",
+  "name": "myfreebot",
+  "description": "24/7 Minecraft Bot SaaS platform with server protection and instant access keys.",
   "version": "1.0.0",
   "capabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

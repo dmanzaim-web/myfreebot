@@ -2,7 +2,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { hashAccessKey, verifyAccessKey } = require("./security");
+const { hashAccessKey, verifyAccessKey, normalizeServerAddress } = require("./security");
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const DB_FILE = path.join(DATA_DIR, "mcfbot.db.json");
@@ -18,7 +18,13 @@ class Database {
       logs: [],
       chat_messages: [],
       activities: [],
-      backups: []
+      backups: [],
+      builder_tasks: [],
+      builder_evidence: [],
+      builder_reports: [],
+      builder_chat: [],
+      builder_settings: [],
+      ai_conversations: []
     };
     this.maxLogsPerServer = 1000;
     this.maxChatPerServer = 500;
@@ -44,7 +50,13 @@ class Database {
           logs: parsed.logs || [],
           chat_messages: parsed.chat_messages || [],
           activities: parsed.activities || [],
-          backups: parsed.backups || []
+          backups: parsed.backups || [],
+          builder_tasks: parsed.builder_tasks || [],
+          builder_evidence: parsed.builder_evidence || [],
+          builder_reports: parsed.builder_reports || [],
+          builder_chat: parsed.builder_chat || [],
+          builder_settings: parsed.builder_settings || [],
+          ai_conversations: parsed.ai_conversations || []
         };
       } else {
         // Clean initial state: 0 servers, 0 bots
@@ -83,9 +95,13 @@ class Database {
       name: s.name,
       host: s.host,
       port: s.port,
+      normalizedAddress: s.normalizedAddress || normalizeServerAddress(s.host, s.port).normalized,
       edition: s.edition,
       version: s.version,
       status: s.status,
+      accessCode: s.accessCode || null,
+      ownerId: s.ownerId || null,
+      isProtected: Boolean(s.protection && s.protection.enabled),
       createdAt: s.createdAt,
       updatedAt: s.updatedAt,
       lastOnline: s.lastOnline,
@@ -97,31 +113,143 @@ class Database {
     return this.data.servers.find((s) => s.id === id) || null;
   }
 
+  findServerByNormalizedAddress(rawHost, rawPort) {
+    if (!rawHost) return null;
+    const target = normalizeServerAddress(rawHost, rawPort).normalized;
+    return this.data.servers.find((s) => {
+      const addr = s.normalizedAddress || normalizeServerAddress(s.host, s.port).normalized;
+      return addr === target;
+    }) || null;
+  }
+
   findServerByAccessKey(rawKey) {
     if (!rawKey) return null;
-    const providedHash = hashAccessKey(rawKey);
+    const clean = String(rawKey).trim();
+
+    // Check if it matches an Access Code (e.g. HEARTLYSMP-4827)
+    const normalizedCode = clean.toUpperCase();
+    const matchByCode = this.data.servers.find(
+      (s) => s.accessCode && s.accessCode.toUpperCase() === normalizedCode
+    );
+    if (matchByCode) return matchByCode;
+
+    // Otherwise check SHA-256 hash for legacy access keys
+    const providedHash = hashAccessKey(clean);
     return this.data.servers.find((s) => s.accessKeyHash === providedHash) || null;
+  }
+
+  findServerByAccessCode(code) {
+    if (!code) return null;
+    const normalized = String(code).trim().toUpperCase();
+    return this.data.servers.find((s) => s.accessCode && s.accessCode.toUpperCase() === normalized) || null;
+  }
+
+  isAccessCodeTaken(code, excludeServerId = null) {
+    if (!code) return false;
+    const normalized = String(code).trim().toUpperCase();
+    return this.data.servers.some(
+      (s) => s.id !== excludeServerId && s.accessCode && s.accessCode.toUpperCase() === normalized
+    );
   }
 
   saveServer(serverData) {
     const existingIndex = this.data.servers.findIndex((s) => s.id === serverData.id);
     const now = Date.now();
 
+    // Ensure normalizedAddress is stored
+    const norm = normalizeServerAddress(serverData.host, serverData.port).normalized;
+    const enriched = {
+      ...serverData,
+      normalizedAddress: norm
+    };
+
     if (existingIndex >= 0) {
       this.data.servers[existingIndex] = {
         ...this.data.servers[existingIndex],
-        ...serverData,
+        ...enriched,
         updatedAt: now
       };
     } else {
       this.data.servers.push({
-        ...serverData,
+        ...enriched,
         createdAt: now,
         updatedAt: now
       });
     }
     this.save();
     return this.getServer(serverData.id);
+  }
+
+  // --- Server Access Sessions & Security ---
+
+  addAccessSession(serverId, sessionToken, role = "member", durationMs = 30 * 24 * 3600 * 1000) {
+    const server = this.getServer(serverId);
+    if (!server) return null;
+    if (!Array.isArray(server.accessSessions)) {
+      server.accessSessions = [];
+    }
+    const now = Date.now();
+    const session = {
+      token: sessionToken,
+      role,
+      createdAt: now,
+      expiresAt: now + durationMs,
+      lastUsedAt: now
+    };
+    server.accessSessions.push(session);
+    server.accessSessions = server.accessSessions.filter((s) => s.expiresAt > now);
+    this.save();
+    return session;
+  }
+
+  verifyAccessSession(serverId, token) {
+    const server = this.getServer(serverId);
+    if (!server || !Array.isArray(server.accessSessions) || !token) return null;
+    const now = Date.now();
+    const session = server.accessSessions.find((s) => s.token === token && s.expiresAt > now);
+    if (session) {
+      session.lastUsedAt = now;
+      this.save();
+      return session;
+    }
+    return null;
+  }
+
+  revokeAllMemberSessions(serverId) {
+    const server = this.getServer(serverId);
+    if (!server || !Array.isArray(server.accessSessions)) return;
+    server.accessSessions = server.accessSessions.filter((s) => s.role === "owner");
+    this.save();
+  }
+
+  // --- Audit Logs ---
+
+  addAuditLog(serverId, action, details, ip = "anonymous", role = "user") {
+    const server = this.getServer(serverId);
+    if (!server) return null;
+    if (!Array.isArray(server.auditLogs)) {
+      server.auditLogs = [];
+    }
+    const cleanIp = String(ip || "anonymous").replace(/^.*:/, "");
+    const logEntry = {
+      id: `aud_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      action,
+      details: String(details || "").slice(0, 200),
+      timestamp: Date.now(),
+      ip: cleanIp,
+      role
+    };
+    server.auditLogs.unshift(logEntry);
+    if (server.auditLogs.length > 100) {
+      server.auditLogs = server.auditLogs.slice(0, 100);
+    }
+    this.save();
+    return logEntry;
+  }
+
+  getAuditLogs(serverId) {
+    const server = this.getServer(serverId);
+    return server?.auditLogs || [];
   }
 
   deleteServer(id) {
@@ -400,6 +528,328 @@ class Database {
     this.data.backups = this.data.backups.filter((b) => b.id !== id);
     this.save();
     return true;
+  }
+
+  restoreBackup(id) {
+    const backup = this.getBackup(id);
+    if (!backup || !backup.data) return false;
+    const { serverId, data } = backup;
+    const server = this.getServer(serverId);
+    if (!server) return false;
+
+    if (Array.isArray(data.workflows)) {
+      this.data.workflows = this.data.workflows.filter((w) => w.serverId !== serverId).concat(data.workflows);
+    }
+    if (Array.isArray(data.schedules)) {
+      this.data.schedules = this.data.schedules.filter((s) => s.serverId !== serverId).concat(data.schedules);
+    }
+    this.save();
+    return true;
+  }
+
+  resetBotConfig(botId) {
+    const bot = this.data.bots.find((b) => b.id === botId);
+    if (!bot) return null;
+    bot.config = {
+      persistent247: true,
+      autoReconnect: true,
+      authType: "offline",
+      antiAfk: {
+        enabled: true,
+        lookAround: true,
+        randomJump: false,
+        sneak: false,
+        walk: false
+      },
+      autoLogin: {
+        enabled: false,
+        command: "/login {password}",
+        trigger: "prompt"
+      },
+      watchlist: []
+    };
+    this.save();
+    return bot;
+  }
+
+  toggleWatchlistPlayer(serverId, username) {
+    const bots = this.getBotsByServer(serverId);
+    if (!bots || bots.length === 0) return [];
+    const bot = bots[0];
+    if (!bot.config) bot.config = {};
+    if (!Array.isArray(bot.config.watchlist)) bot.config.watchlist = [];
+    const clean = String(username || "").trim().toLowerCase();
+    if (!clean) return bot.config.watchlist;
+
+    const idx = bot.config.watchlist.indexOf(clean);
+    if (idx >= 0) {
+      bot.config.watchlist.splice(idx, 1);
+    } else {
+      bot.config.watchlist.push(clean);
+    }
+    this.saveBot(bot);
+    return bot.config.watchlist;
+  }
+
+  // --- Bot Builder Tasks & Agents ---
+
+  getBuilderTasks(serverId) {
+    if (!Array.isArray(this.data.builder_tasks)) this.data.builder_tasks = [];
+    return this.data.builder_tasks.filter((t) => t.serverId === serverId).sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  getBuilderTask(id) {
+    if (!Array.isArray(this.data.builder_tasks)) this.data.builder_tasks = [];
+    return this.data.builder_tasks.find((t) => t.id === id) || null;
+  }
+
+  saveBuilderTask(task) {
+    if (!Array.isArray(this.data.builder_tasks)) this.data.builder_tasks = [];
+    const idx = this.data.builder_tasks.findIndex((t) => t.id === task.id);
+    const enriched = {
+      ...task,
+      updatedAt: Date.now()
+    };
+    if (idx >= 0) {
+      this.data.builder_tasks[idx] = enriched;
+    } else {
+      enriched.createdAt = enriched.createdAt || Date.now();
+      this.data.builder_tasks.unshift(enriched);
+    }
+    // Limit to 200 tasks per server
+    if (this.data.builder_tasks.length > 500) {
+      this.data.builder_tasks = this.data.builder_tasks.slice(0, 500);
+    }
+    this.save();
+    return enriched;
+  }
+
+  deleteBuilderTask(id) {
+    if (!Array.isArray(this.data.builder_tasks)) this.data.builder_tasks = [];
+    this.data.builder_tasks = this.data.builder_tasks.filter((t) => t.id !== id);
+    this.save();
+    return true;
+  }
+
+  // --- Bot Builder Guardian Evidence ---
+
+  getBuilderEvidence(serverId) {
+    if (!Array.isArray(this.data.builder_evidence)) this.data.builder_evidence = [];
+    return this.data.builder_evidence.filter((e) => e.serverId === serverId).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  saveBuilderEvidence(evidence) {
+    if (!Array.isArray(this.data.builder_evidence)) this.data.builder_evidence = [];
+    const idx = this.data.builder_evidence.findIndex((e) => e.id === evidence.id || (e.serverId === evidence.serverId && e.playerName?.toLowerCase() === evidence.playerName?.toLowerCase()));
+    const enriched = {
+      ...evidence,
+      updatedAt: Date.now()
+    };
+    if (idx >= 0) {
+      this.data.builder_evidence[idx] = enriched;
+    } else {
+      enriched.id = enriched.id || `evi_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      enriched.createdAt = enriched.createdAt || Date.now();
+      this.data.builder_evidence.unshift(enriched);
+    }
+    this.save();
+    return enriched;
+  }
+
+  // --- Bot Builder Analyst Reports ---
+
+  getBuilderReports(serverId) {
+    if (!Array.isArray(this.data.builder_reports)) this.data.builder_reports = [];
+    return this.data.builder_reports.filter((r) => r.serverId === serverId).sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  saveBuilderReport(report) {
+    if (!Array.isArray(this.data.builder_reports)) this.data.builder_reports = [];
+    const enriched = {
+      ...report,
+      id: report.id || `rep_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      createdAt: report.createdAt || Date.now()
+    };
+    this.data.builder_reports.unshift(enriched);
+    if (this.data.builder_reports.length > 100) {
+      this.data.builder_reports = this.data.builder_reports.slice(0, 100);
+    }
+    this.save();
+    return enriched;
+  }
+
+  // --- Bot Builder Interactive Chat ---
+
+  getBuilderChat(serverId, limit = 50) {
+    if (!Array.isArray(this.data.builder_chat)) this.data.builder_chat = [];
+    const msgs = this.data.builder_chat.filter((c) => c.serverId === serverId);
+    return msgs.slice(-limit);
+  }
+
+  addBuilderChatMessage(serverId, msg) {
+    if (!Array.isArray(this.data.builder_chat)) this.data.builder_chat = [];
+    const entry = {
+      id: `bc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      serverId,
+      sender: msg.sender || "user", // user, ai, guardian, builder, admin, automation, analyst
+      role: msg.role || "user",
+      agentType: msg.agentType || null,
+      content: String(msg.content || "").slice(0, 4000),
+      timestamp: Date.now()
+    };
+    this.data.builder_chat.push(entry);
+    // Keep max 300 chat messages per server
+    const serverChat = this.data.builder_chat.filter((c) => c.serverId === serverId);
+    if (serverChat.length > 300) {
+      this.data.builder_chat = this.data.builder_chat.filter((c) => c.serverId !== serverId || serverChat.slice(-300).some((s) => s.id === c.id));
+    }
+    this.save();
+    return entry;
+  }
+
+  // --- Bot Builder Settings & Permissions ---
+
+  getBuilderSettings(serverId) {
+    if (!Array.isArray(this.data.builder_settings)) this.data.builder_settings = [];
+    const found = this.data.builder_settings.find((s) => s.serverId === serverId);
+    if (found) return found;
+
+    // Default settings
+    return {
+      serverId,
+      autoPunishEnabled: false,
+      evidenceThreshold: 90, // %
+      banDurationDays: 30,
+      creativeBuildMode: true,
+      buildAreaConstraint: {
+        radius: 150,
+        safeZoneOnly: true,
+        respectProtectedRegions: true
+      },
+      rollbacksEnabled: true,
+      lagThresholdTps: 15,
+      notificationChannel: "CHAT_AND_DASHBOARD",
+      welcomeMessage: "Welcome {player} to our Minecraft Server! Type /help for instructions.",
+      alertDeathCount: 5,
+      alertDeathWindowMinutes: 10
+    };
+  }
+
+  saveBuilderSettings(serverId, newSettings) {
+    if (!Array.isArray(this.data.builder_settings)) this.data.builder_settings = [];
+    const current = this.getBuilderSettings(serverId);
+    const updated = {
+      ...current,
+      ...newSettings,
+      serverId,
+      updatedAt: Date.now()
+    };
+    const idx = this.data.builder_settings.findIndex((s) => s.serverId === serverId);
+    if (idx >= 0) {
+      this.data.builder_settings[idx] = updated;
+    } else {
+      this.data.builder_settings.push(updated);
+    }
+    this.save();
+    return updated;
+  }
+
+  // --- Server AI Chat Conversations ---
+
+  getAiConversations(serverId) {
+    if (!Array.isArray(this.data.ai_conversations)) this.data.ai_conversations = [];
+    return this.data.ai_conversations
+      .filter((c) => c.serverId === serverId)
+      .sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+  }
+
+  getAiConversation(id) {
+    if (!Array.isArray(this.data.ai_conversations)) this.data.ai_conversations = [];
+    return this.data.ai_conversations.find((c) => c.id === id) || null;
+  }
+
+  saveAiConversation(conv) {
+    if (!Array.isArray(this.data.ai_conversations)) this.data.ai_conversations = [];
+    const now = Date.now();
+    const enriched = {
+      ...conv,
+      id: conv.id || `conv_${now}_${Math.random().toString(36).slice(2, 7)}`,
+      createdAt: conv.createdAt || now,
+      updatedAt: now,
+      messages: Array.isArray(conv.messages) ? conv.messages : []
+    };
+
+    const idx = this.data.ai_conversations.findIndex((c) => c.id === enriched.id);
+    if (idx >= 0) {
+      this.data.ai_conversations[idx] = enriched;
+    } else {
+      this.data.ai_conversations.unshift(enriched);
+    }
+
+    if (this.data.ai_conversations.length > 500) {
+      this.data.ai_conversations = this.data.ai_conversations.slice(0, 500);
+    }
+    this.save();
+    return enriched;
+  }
+
+  deleteAiConversation(id) {
+    if (!Array.isArray(this.data.ai_conversations)) this.data.ai_conversations = [];
+    this.data.ai_conversations = this.data.ai_conversations.filter((c) => c.id !== id);
+    this.save();
+    return true;
+  }
+
+  renameAiConversation(id, newTitle) {
+    const conv = this.getAiConversation(id);
+    if (!conv) return null;
+    conv.title = String(newTitle || "Untitled Chat").trim().slice(0, 80);
+    conv.updatedAt = Date.now();
+    this.save();
+    return conv;
+  }
+
+  addAiMessage(convId, message) {
+    const conv = this.getAiConversation(convId);
+    if (!conv) return null;
+    if (!Array.isArray(conv.messages)) conv.messages = [];
+
+    const msg = {
+      id: message.id || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      role: message.role || "user", // "user" | "assistant" | "system"
+      content: String(message.content || ""),
+      mode: message.mode || "chat", // "chat" | "agent"
+      thought: message.thought || null,
+      actions: Array.isArray(message.actions) ? message.actions : [],
+      timestamp: message.timestamp || Date.now()
+    };
+
+    conv.messages.push(msg);
+    conv.updatedAt = Date.now();
+
+    // Auto update title from first user message if default
+    if (conv.title === "New Conversation" && msg.role === "user") {
+      conv.title = msg.content.trim().slice(0, 45) + (msg.content.length > 45 ? "..." : "");
+    }
+
+    this.save();
+    return msg;
+  }
+
+  updateAiMessageAction(convId, messageId, actionIndex, updateData) {
+    const conv = this.getAiConversation(convId);
+    if (!conv || !Array.isArray(conv.messages)) return null;
+
+    const msg = conv.messages.find((m) => m.id === messageId);
+    if (!msg || !Array.isArray(msg.actions) || !msg.actions[actionIndex]) return null;
+
+    msg.actions[actionIndex] = {
+      ...msg.actions[actionIndex],
+      ...updateData
+    };
+    conv.updatedAt = Date.now();
+    this.save();
+    return msg.actions[actionIndex];
   }
 }
 
